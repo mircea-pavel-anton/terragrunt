@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/gruntwork-io/terragrunt/internal/configbridge"
 	"github.com/gruntwork-io/terragrunt/internal/iacargs"
 	"github.com/gruntwork-io/terragrunt/internal/tf"
@@ -24,6 +26,7 @@ import (
 	"github.com/gruntwork-io/terragrunt/internal/report"
 	"github.com/gruntwork-io/terragrunt/internal/runner/common"
 	"github.com/gruntwork-io/terragrunt/internal/runner/run/creds"
+	"github.com/gruntwork-io/terragrunt/internal/runner/runnerpool/progress"
 	"github.com/gruntwork-io/terragrunt/internal/telemetry"
 	"github.com/gruntwork-io/terragrunt/pkg/config"
 	"github.com/gruntwork-io/terragrunt/pkg/log"
@@ -404,6 +407,22 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 		}
 	}
 
+	// Set up progress TUI if enabled.
+	var program *tea.Program
+
+	if stackOpts.Progress {
+		unitPaths := make([]string, 0, len(rnr.queue.Entries))
+		displayPaths := make([]string, 0, len(rnr.queue.Entries))
+
+		for _, entry := range rnr.queue.Entries {
+			unitPaths = append(unitPaths, entry.Component.Path())
+			displayPaths = append(displayPaths, entry.Component.DisplayPath())
+		}
+
+		model := progress.NewModel(unitPaths, displayPaths)
+		program = tea.NewProgram(model, tea.WithContext(ctx))
+	}
+
 	task := func(ctx context.Context, u *component.Unit) error {
 		// Build per-unit opts and logger on demand
 		unitOpts, unitLogger, err := BuildUnitOpts(l, stackOpts, u)
@@ -429,8 +448,17 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 			"working_dir":            unitOpts.WorkingDir,
 			"terragrunt_config_path": unitOpts.TerragruntConfigPath,
 		}, func(childCtx context.Context) error {
-			// Wrap the writer to buffer unit-scoped output
-			unitWriter := NewUnitWriter(unitOpts.Writers.Writer)
+			// Wrap the writer to buffer unit-scoped output.
+			// In progress mode, route output through the TUI; otherwise use standard buffering.
+			var unitWriter *UnitWriter
+
+			if program != nil {
+				progressWriter := progress.NewWriter(u.Path(), program)
+				unitWriter = NewUnitWriter(progressWriter)
+			} else {
+				unitWriter = NewUnitWriter(unitOpts.Writers.Writer)
+			}
+
 			unitOpts.Writers.Writer = unitWriter
 			unitRunner := common.NewUnitRunner(u)
 
@@ -479,14 +507,56 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 	rnr.queue.IgnoreDependencyOrder = stackOpts.IgnoreDependencyOrder
 	// Allow continuing the queue when dependencies fail if requested via CLI
 	rnr.queue.IgnoreDependencyErrors = stackOpts.IgnoreDependencyErrors
+
+	controllerOpts := []ControllerOption{
+		WithRunner(task),
+		WithMaxConcurrency(stackOpts.Parallelism),
+	}
+
+	// Wire up status callback for the progress TUI.
+	if program != nil {
+		controllerOpts = append(controllerOpts, WithStatusCallback(func(path string, status queue.Status) {
+			var ps progress.UnitStatus
+
+			switch status {
+			case queue.StatusRunning:
+				ps = progress.StatusRunning
+			case queue.StatusSucceeded:
+				ps = progress.StatusSucceeded
+			case queue.StatusFailed:
+				ps = progress.StatusFailed
+			case queue.StatusEarlyExit:
+				ps = progress.StatusEarlyExit
+			default:
+				return
+			}
+
+			program.Send(progress.UnitStatusMsg{Path: path, Status: ps})
+		}))
+	}
+
 	controller := NewController(
 		rnr.queue,
 		rnr.Stack.Units,
-		WithRunner(task),
-		WithMaxConcurrency(stackOpts.Parallelism),
+		controllerOpts...,
 	)
 
-	err := controller.Run(ctx, l)
+	// Run the controller and optionally the TUI in parallel.
+	var err error
+
+	if program != nil {
+		// Run the controller in a goroutine; the TUI blocks the main goroutine.
+		go func() {
+			err = controller.Run(ctx, l)
+			program.Send(progress.DoneMsg{})
+		}()
+
+		if _, tuiErr := program.Run(); tuiErr != nil {
+			l.Warnf("Progress TUI error: %v", tuiErr)
+		}
+	} else {
+		err = controller.Run(ctx, l)
+	}
 
 	// Emit report entries for early exit and failed units after controller completes
 	if r != nil {

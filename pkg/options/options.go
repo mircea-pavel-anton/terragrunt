@@ -271,6 +271,8 @@ type TerragruntOptions struct {
 	NoHooks bool
 	// If set, disable automatic reading of .terragrunt-filters file.
 	NoFiltersFile bool
+	// Progress enables the BuildKit-style live progress TUI for parallel unit execution.
+	Progress bool
 }
 
 // TerragruntOptionsFunc is a functional option type used to pass options in certain integration tests

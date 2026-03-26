@@ -47,6 +47,11 @@ func Run(ctx context.Context, l log.Logger, opts *options.TerragruntOptions) err
 		}
 	}
 
+	// Auto-disable progress TUI when stdout is not an interactive terminal.
+	if opts.Progress && (l.Formatter().DisabledColors() || stdout.IsRedirected()) {
+		opts.Progress = false
+	}
+
 	runnerOpts := []common.Option{}
 
 	r := report.NewReport().WithWorkingDir(opts.WorkingDir)

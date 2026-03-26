@@ -22,11 +22,12 @@ type UnitRunner func(ctx context.Context, u *component.Unit) error
 
 // Controller orchestrates concurrent execution over a DAG.
 type Controller struct {
-	q           *queue.Queue
-	runner      UnitRunner
-	readyCh     chan struct{}
-	unitsMap    map[string]*component.Unit
-	concurrency int
+	q              *queue.Queue
+	runner         UnitRunner
+	readyCh        chan struct{}
+	unitsMap       map[string]*component.Unit
+	concurrency    int
+	statusCallback func(path string, status queue.Status)
 }
 
 // ControllerOption is a function that modifies a Controller.
@@ -36,6 +37,13 @@ type ControllerOption func(*Controller)
 func WithRunner(runner UnitRunner) ControllerOption {
 	return func(dr *Controller) {
 		dr.runner = runner
+	}
+}
+
+// WithStatusCallback sets a callback that is invoked whenever a unit's status changes.
+func WithStatusCallback(cb func(path string, status queue.Status)) ControllerOption {
+	return func(dr *Controller) {
+		dr.statusCallback = cb
 	}
 }
 
@@ -115,6 +123,10 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 				l.Debugf("Runner Pool Controller: running %s", e.Component.Path())
 				dr.q.SetEntryStatus(e, queue.StatusRunning)
 
+				if dr.statusCallback != nil {
+					dr.statusCallback(e.Component.Path(), queue.StatusRunning)
+				}
+
 				sem <- struct{}{}
 
 				wg.Add(1)
@@ -135,6 +147,11 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 						err := errors.Errorf("unit for path %s not found in discovered units", ent.Component.Path())
 						l.Errorf("Runner Pool Controller: unit for path %s not found in discovered units, skipping execution", ent.Component.Path())
 						dr.q.FailEntry(ent)
+
+						if dr.statusCallback != nil {
+							dr.statusCallback(ent.Component.Path(), queue.StatusFailed)
+						}
+
 						results.Store(ent.Component.Path(), err)
 
 						return
@@ -147,11 +164,19 @@ func (dr *Controller) Run(ctx context.Context, l log.Logger) error {
 						l.Debugf("Runner Pool Controller: %s failed", ent.Component.Path())
 						dr.q.FailEntry(ent)
 
+						if dr.statusCallback != nil {
+							dr.statusCallback(ent.Component.Path(), queue.StatusFailed)
+						}
+
 						return
 					}
 
 					l.Debugf("Runner Pool Controller: %s succeeded", ent.Component.Path())
 					dr.q.SetEntryStatus(ent, queue.StatusSucceeded)
+
+					if dr.statusCallback != nil {
+						dr.statusCallback(ent.Component.Path(), queue.StatusSucceeded)
+					}
 				}(e)
 			}
 
