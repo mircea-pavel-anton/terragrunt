@@ -159,8 +159,12 @@ func RunAllOnStack(ctx context.Context, l log.Logger, opts *options.TerragruntOp
 	l.Debugf("%s", rnr.GetStack().String())
 
 	isDestroy := opts.TerraformCliArgs.IsDestroyCommand(opts.TerraformCommand)
-	if err := rnr.LogUnitDeployOrder(l, opts.TerraformCommand, isDestroy, opts.Writers.LogShowAbsPaths); err != nil {
-		return err
+
+	// Skip deploy order logging in progress mode — the TUI already shows all units with status.
+	if !opts.Progress {
+		if err := rnr.LogUnitDeployOrder(l, opts.TerraformCommand, isDestroy, opts.Writers.LogShowAbsPaths); err != nil {
+			return err
+		}
 	}
 
 	var prompt string

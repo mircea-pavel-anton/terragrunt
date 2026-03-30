@@ -435,13 +435,6 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 			syncUnitCliArgs(l, stackOpts, unitOpts, u)
 		}
 
-		// Wrap ErrWriter with plan error buffer for plan commands
-		if isPlan {
-			if buf := planErrorBuffers[u.Path()]; buf != nil {
-				unitOpts.Writers.ErrWriter = io.MultiWriter(buf, unitOpts.Writers.ErrWriter)
-			}
-		}
-
 		return telemetry.TelemeterFromContext(ctx).Collect(ctx, "runner_pool_task", map[string]any{
 			"terraform_command":      unitOpts.TerraformCommand,
 			"terraform_cli_args":     unitOpts.TerraformCliArgs,
@@ -455,8 +448,21 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 			if program != nil {
 				progressWriter := progress.NewWriter(u.Path(), program)
 				unitWriter = NewUnitWriter(progressWriter)
+				// Also redirect ErrWriter and logger output through the TUI
+				// so that log messages don't leak directly to the terminal.
+				unitOpts.Writers.ErrWriter = progressWriter
+				unitLogger.SetOptions(log.WithOutput(progressWriter))
 			} else {
 				unitWriter = NewUnitWriter(unitOpts.Writers.Writer)
+			}
+
+			// Wrap ErrWriter with plan error buffer for plan commands.
+			// This must happen after progress writer setup so the buffer
+			// tees into the (possibly redirected) ErrWriter.
+			if isPlan {
+				if buf := planErrorBuffers[u.Path()]; buf != nil {
+					unitOpts.Writers.ErrWriter = io.MultiWriter(buf, unitOpts.Writers.ErrWriter)
+				}
 			}
 
 			unitOpts.Writers.Writer = unitWriter
@@ -546,8 +552,12 @@ func (rnr *Runner) Run(ctx context.Context, l log.Logger, stackOpts *options.Ter
 
 	if program != nil {
 		// Run the controller in a goroutine; the TUI blocks the main goroutine.
+		// Use a logger clone that writes to io.Discard so controller debug messages
+		// don't leak to the terminal — per-unit output is routed through the TUI.
+		controllerLogger := l.WithOptions(log.WithOutput(io.Discard))
+
 		go func() {
-			err = controller.Run(ctx, l)
+			err = controller.Run(ctx, controllerLogger)
 			program.Send(progress.DoneMsg{})
 		}()
 
